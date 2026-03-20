@@ -52,6 +52,8 @@ public class RecursionInspection extends AbstractBaseJavaLocalInspectionTool {
      */
     public @NotNull PsiElementVisitor buildVisitor(@NotNull final ProblemsHolder holder, boolean isOnTheFly) {
         return new JavaElementVisitor() {
+            private final Set<PsiMethod> visitedKernels = new HashSet<>();
+
             @Override
             public void visitAnnotation(PsiAnnotation annotation) {
                 super.visitAnnotation(annotation);
@@ -60,6 +62,7 @@ public class RecursionInspection extends AbstractBaseJavaLocalInspectionTool {
 
                 PsiMethod kernelMethod = PsiTreeUtil.getParentOfType(annotation, PsiMethod.class);
                 if (kernelMethod == null) return;
+                if (!visitedKernels.add(kernelMethod)) return;
 
                 KernelCallGraphAnalyzer.AnalysisScope scope =
                         KernelCallGraphAnalyzer.resolve(kernelMethod);
@@ -69,7 +72,12 @@ public class RecursionInspection extends AbstractBaseJavaLocalInspectionTool {
                 }
 
                 for (var entry : scope.getNonAnalyzableCallSites().entrySet()) {
-                    holder.registerProblem(entry.getKey(),
+                    PsiMethodCallExpression callExpr = entry.getKey();
+                    PsiElement reportTarget = callExpr.getContainingFile().equals(holder.getFile())
+                            ? callExpr
+                            : (kernelMethod.getNameIdentifier() != null ? kernelMethod.getNameIdentifier() : kernelMethod);
+                    ProblemMethods.getInstance().addMethod(holder.getProject(), holder.getFile(), kernelMethod);
+                    holder.registerProblem(reportTarget,
                             MessageBundle.message("inspection.helper.unresolvable")
                                     + ": " + entry.getValue(),
                             ProblemHighlightType.WEAK_WARNING);
@@ -91,7 +99,12 @@ public class RecursionInspection extends AbstractBaseJavaLocalInspectionTool {
                         }
 
                         for (var entry : scope.getNonAnalyzableCallSites().entrySet()) {
-                            holder.registerProblem(entry.getKey(),
+                            PsiMethodCallExpression callExpr = entry.getKey();
+                            PsiElement reportTarget = callExpr.getContainingFile().equals(holder.getFile())
+                                    ? callExpr
+                                    : (method.getNameIdentifier() != null ? method.getNameIdentifier() : method);
+                            ProblemMethods.getInstance().addMethod(holder.getProject(), holder.getFile(), method);
+                            holder.registerProblem(reportTarget,
                                     MessageBundle.message("inspection.helper.unresolvable")
                                             + ": " + entry.getValue(),
                                     ProblemHighlightType.WEAK_WARNING);
@@ -112,8 +125,11 @@ public class RecursionInspection extends AbstractBaseJavaLocalInspectionTool {
                         if (isRecursive(calledMethod, visited)) {
                             if (calledMethod == null) return;
                             ProblemMethods.getInstance().addMethod(holder.getProject(), holder.getFile(), kernelMethod);
+                            PsiElement recursionTarget = calledMethod.getContainingFile().equals(holder.getFile())
+                                    ? calledMethod
+                                    : (kernelMethod.getNameIdentifier() != null ? kernelMethod.getNameIdentifier() : kernelMethod);
                             holder.registerProblem(
-                                    calledMethod,
+                                    recursionTarget,
                                     MessageBundle.message("inspection.recursion") + context,
                                     ProblemHighlightType.ERROR);
                         }

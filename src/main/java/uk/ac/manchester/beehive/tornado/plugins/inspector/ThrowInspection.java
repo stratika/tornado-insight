@@ -27,6 +27,7 @@ import uk.ac.manchester.beehive.tornado.plugins.util.MessageBundle;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.HashSet;
+import java.util.Set;
 
 /**
  * A custom inspection tool to check for thrown exceptions within methods annotated with
@@ -55,6 +56,8 @@ public class ThrowInspection extends AbstractBaseJavaLocalInspectionTool {
         HashSet<PsiThrowStatement> reportedStatement = new HashSet<>();
         HashSet<PsiMethod> reportedMethod = new HashSet<>();
         return new JavaElementVisitor() {
+            private final Set<PsiMethod> visitedKernels = new HashSet<>();
+
             @Override
             public void visitAnnotation(PsiAnnotation annotation) {
                 super.visitAnnotation(annotation);
@@ -62,6 +65,7 @@ public class ThrowInspection extends AbstractBaseJavaLocalInspectionTool {
 
                 PsiMethod kernelMethod = PsiTreeUtil.getParentOfType(annotation, PsiMethod.class);
                 if (kernelMethod == null) return;
+                if (!visitedKernels.add(kernelMethod)) return;
 
                 KernelCallGraphAnalyzer.AnalysisScope scope =
                         KernelCallGraphAnalyzer.resolve(kernelMethod);

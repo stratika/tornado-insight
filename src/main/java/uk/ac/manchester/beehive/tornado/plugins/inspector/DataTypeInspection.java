@@ -26,6 +26,9 @@ import uk.ac.manchester.beehive.tornado.plugins.entity.ProblemMethods;
 import uk.ac.manchester.beehive.tornado.plugins.util.MessageBundle;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /**
  * This inspection tool identifies and highlights unsupported data types
  * within methods that are annotated with either "@Parallel" or "@Reduce".
@@ -52,12 +55,15 @@ public class DataTypeInspection extends AbstractBaseJavaLocalInspectionTool {
     @Override
     public PsiElementVisitor buildVisitor(@NotNull final ProblemsHolder holder, boolean isOnTheFly) {
         return new JavaElementVisitor() {
+            private final Set<PsiMethod> visitedKernels = new HashSet<>();
+
             @Override
             public void visitAnnotation(PsiAnnotation annotation) {
                 if (!KernelCallGraphAnalyzer.isKernelAnnotation(annotation)) return;
 
                 PsiMethod kernelMethod = PsiTreeUtil.getParentOfType(annotation, PsiMethod.class);
                 if (kernelMethod == null) return;
+                if (!visitedKernels.add(kernelMethod)) return;
 
                 KernelCallGraphAnalyzer.AnalysisScope scope =
                         KernelCallGraphAnalyzer.resolve(kernelMethod);

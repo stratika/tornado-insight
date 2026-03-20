@@ -26,7 +26,9 @@ import uk.ac.manchester.beehive.tornado.plugins.entity.ProblemMethods;
 import uk.ac.manchester.beehive.tornado.plugins.util.MessageBundle;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The `ExternalLibraryInspection` class checks for external library method
@@ -52,6 +54,8 @@ public class ExternalLibraryInspection extends AbstractBaseJavaLocalInspectionTo
      */
     public @NotNull PsiElementVisitor buildVisitor(@NotNull final ProblemsHolder holder, boolean isOnTheFly) {
         return new JavaElementVisitor() {
+            private final Set<PsiMethod> visitedKernels = new HashSet<>();
+
             @Override
             public void visitAnnotation(PsiAnnotation annotation) {
                 super.visitAnnotation(annotation);
@@ -59,6 +63,7 @@ public class ExternalLibraryInspection extends AbstractBaseJavaLocalInspectionTo
 
                 PsiMethod kernelMethod = PsiTreeUtil.getParentOfType(annotation, PsiMethod.class);
                 if (kernelMethod == null) return;
+                if (!visitedKernels.add(kernelMethod)) return;
 
                 KernelCallGraphAnalyzer.AnalysisScope scope =
                         KernelCallGraphAnalyzer.resolve(kernelMethod);
@@ -77,7 +82,10 @@ public class ExternalLibraryInspection extends AbstractBaseJavaLocalInspectionTo
                                             !qualifiedName.startsWith("uk.ac.manchester.tornado") &&
                                             !qualifiedName.startsWith("_Dummy_")) {
                                         ProblemMethods.getInstance().addMethod(holder.getProject(), holder.getFile(), kernelMethod);
-                                        holder.registerProblem(expression,
+                                        PsiElement reportTarget = expression.getContainingFile().equals(holder.getFile())
+                                                ? expression
+                                                : (kernelMethod.getNameIdentifier() != null ? kernelMethod.getNameIdentifier() : kernelMethod);
+                                        holder.registerProblem(reportTarget,
                                                 MessageBundle.message("inspection.externalLibrary") + context,
                                                 ProblemHighlightType.WARNING);
                                     }
@@ -88,7 +96,12 @@ public class ExternalLibraryInspection extends AbstractBaseJavaLocalInspectionTo
                 }
 
                 for (var entry : scope.getNonAnalyzableCallSites().entrySet()) {
-                    holder.registerProblem(entry.getKey(),
+                    PsiMethodCallExpression callExpr = entry.getKey();
+                    PsiElement reportTarget = callExpr.getContainingFile().equals(holder.getFile())
+                            ? callExpr
+                            : (kernelMethod.getNameIdentifier() != null ? kernelMethod.getNameIdentifier() : kernelMethod);
+                    ProblemMethods.getInstance().addMethod(holder.getProject(), holder.getFile(), kernelMethod);
+                    holder.registerProblem(reportTarget,
                             MessageBundle.message("inspection.helper.unresolvable")
                                     + ": " + entry.getValue(),
                             ProblemHighlightType.WEAK_WARNING);

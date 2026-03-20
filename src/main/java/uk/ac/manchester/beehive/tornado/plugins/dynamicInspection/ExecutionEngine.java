@@ -34,6 +34,7 @@ import com.intellij.openapi.options.ShowSettingsUtil;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.projectRoots.JavaSdkVersion;
 import com.intellij.openapi.projectRoots.Sdk;
+import com.intellij.openapi.roots.OrderEnumerator;
 import com.intellij.openapi.roots.ProjectRootManager;
 import com.intellij.openapi.roots.ui.configuration.ProjectSettingsService;
 import com.intellij.psi.PsiMethod;
@@ -48,6 +49,7 @@ import org.jetbrains.annotations.NotNull;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.MalformedURLException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -70,6 +72,7 @@ public class ExecutionEngine {
 
     private boolean completed;
     private boolean hasRuntimeErrors;
+    private String projectClasspath;
 
     public ExecutionEngine(Project project, String tempFolderPath, HashMap<String, PsiMethod> fileMethodMap) {
         this.project = project;
@@ -77,6 +80,7 @@ public class ExecutionEngine {
         this.fileMethodMap = fileMethodMap;
         this.completed = false;
         this.hasRuntimeErrors = false;
+        this.projectClasspath = "";
     }
 
     private static boolean isWindows() {
@@ -97,6 +101,19 @@ public class ExecutionEngine {
         if (!validateTornadoSdk()) {
             return;
         }
+
+        // Compute project classpath before entering background thread.
+        // OrderEnumerator accesses the project model and must be called under a read action.
+        // This captures all project output dirs and dependency JARs so that user-defined classes
+        // (e.g. com.vinhderful.raytracer.utils.*) are available to javac and to TornadoVM at JIT time.
+        ApplicationManager.getApplication().runReadAction((Runnable) () -> {
+            projectClasspath = OrderEnumerator.orderEntries(project)
+                    .recursively()
+                    .withoutSdk()
+                    .classes()
+                    .getPathsList()
+                    .getPathsString();
+        });
 
         long startTime = System.currentTimeMillis();
         ApplicationManager.getApplication().executeOnPooledThread(() -> {
@@ -219,6 +236,10 @@ public class ExecutionEngine {
         }
 
         String classpath = apiPath + File.pathSeparator + matricesPath + File.pathSeparator + unitTestPath;
+        if (!projectClasspath.isEmpty()) {
+            classpath = classpath + File.pathSeparator + projectClasspath;
+        }
+        LOG.info("TornadoVM compile classpath: " + classpath);
 
         GeneralCommandLine commandLine = new GeneralCommandLine();
         String javacPath = projectSdk.getHomePath() + File.separator + "bin" + File.separator + "javac";
@@ -251,6 +272,26 @@ public class ExecutionEngine {
         }
     }
 
+    /**
+     * Converts a platform-style classpath (colon/semicolon-separated) to the space-separated
+     * list of file: URLs required by the JAR manifest Class-Path attribute.
+     */
+    private static String buildManifestClassPath(String classpath) {
+        if (classpath == null || classpath.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String entry : classpath.split(File.pathSeparator)) {
+            if (entry.isEmpty()) continue;
+            try {
+                String url = new File(entry).toURI().toURL().toString();
+                if (sb.length() > 0) sb.append(" ");
+                sb.append(url);
+            } catch (MalformedURLException ignored) {
+                // skip entries that can't be converted
+            }
+        }
+        return sb.toString();
+    }
+
     private void packFolder(String classFolderPath, String outputFolderPath) {
         MessageUtils.getInstance(project).showInfoMsg(MessageBundle.message("dynamic.info.title"),
                 MessageBundle.message("dynamic.info.packing"));
@@ -265,10 +306,18 @@ public class ExecutionEngine {
             outputFolder.mkdirs();
         }
 
+        // Build manifest Class-Path from project output dirs and dependency JARs so that
+        // TornadoVM's sketch builder can resolve user-defined classes (e.g. Angle, World) at JIT time.
+        // The JVM honors the manifest Class-Path when running with -jar.
+        String manifestClassPath = buildManifestClassPath(projectClasspath);
+
         for (File classFile : classFiles) {
             Manifest manifest = new Manifest();
             manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
             manifest.getMainAttributes().put(Attributes.Name.MAIN_CLASS, classFile.getName().replace(".class", ""));
+            if (!manifestClassPath.isEmpty()) {
+                manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, manifestClassPath);
+            }
 
             File outputJar = new File(outputFolder, classFile.getName().replace(".class", ".jar"));
 
@@ -398,6 +447,7 @@ public class ExecutionEngine {
         commandLine.setExePath(tornadoExe);
         configureEnvironmentVariables(commandLine);
         commandLine.addParameter("--printKernel");
+        commandLine.addParameter("--jvm=-Dgraal.MaximumInliningSize=1000");
 
         // Add bytecode dump flag if enabled
         if (TornadoSettingState.getInstance().bytecodeVisualizerEnabled) {

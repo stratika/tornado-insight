@@ -31,14 +31,8 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.security.SecureRandom;
-import java.util.Optional;
-import java.util.Set;
 
 public class CodeGenerator {
 
@@ -104,12 +98,43 @@ public class CodeGenerator {
         String taskParameters = getTaskParameters(method, taskParametersInfos);
         String mainCode = getTaskGraphCode(method, maybeOriginalTaskGraph, taskParameters, methodWithClass);
 
+        // Collect imports and static fields from helper classes
+        String helperImports = TornadoTWTask.getHelperImports(others);
+        Map<String, Object> helperFields = TornadoTWTask.getHelperFields(others);
+        Map<String, Object> staticImportFields = TornadoTWTask.getStaticImportFields(TornadoTWTask.getPsiFile(), others);
+
+        // Merge fields: helper class fields as base, then static-imported constants, kernel fields win conflicts
+        Map<String, Object> allFields = new LinkedHashMap<>(helperFields);
+        allFields.putAll(staticImportFields);
+        allFields.putAll(fields);
+
+        // Build set of inlined constant names so we can drop redundant static imports below
+        Set<String> inlinedConstantNames = new HashSet<>();
+        for (String key : allFields.keySet()) {
+            String[] parts = key.trim().split("\\s+");
+            if (parts.length > 0) inlinedConstantNames.add(parts[parts.length - 1]);
+        }
+
+        // Deduplicate imports; also drop static imports whose constant is now inlined as a field
+        // (keeps method-imports like "import static TornadoMath.max" which are not in allFields)
+        Set<String> uniqueImports = new LinkedHashSet<>();
+        for (String line : (importCode + importCodeBlock + helperImports).split("\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+            if (trimmed.startsWith("import static ")) {
+                String member = trimmed.replace("import static ", "").replace(";", "").trim();
+                String memberName = member.contains(".") ? member.substring(member.lastIndexOf('.') + 1) : member;
+                if (inlinedConstantNames.contains(memberName)) continue;
+            }
+            uniqueImports.add(trimmed);
+        }
+
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(javaFile))) {
-            writer.write(importCode + importCodeBlock);
+            writer.write(String.join("\n", uniqueImports));
             writer.write("\n");
             writer.write("public class " + javaFile.getName().replace(".java", "") + " {\n");
 
-            for (Map.Entry<String, Object> field : fields.entrySet()) {
+            for (Map.Entry<String, Object> field : allFields.entrySet()) {
                 writer.write(field.getKey());
                 if (field.getValue() != null) {
                     writer.write(" = " + field.getValue());

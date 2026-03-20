@@ -26,7 +26,6 @@ import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.*;
 import com.intellij.psi.util.PsiTreeUtil;
 import com.intellij.util.concurrency.AppExecutorUtil;
-import uk.ac.manchester.beehive.tornado.plugins.entity.ProblemMethods;
 
 import javax.swing.*;
 import java.util.*;
@@ -292,17 +291,133 @@ public class TornadoTWTask {
         PsiImportList importList = javaFile.getImportList();
 
         if (importList != null) {
-            PsiImportStatement[] importStatements = importList.getImportStatements();
-            for (PsiImportStatement importStatement : importStatements) {
+            for (PsiImportStatement importStatement : importList.getImportStatements()) {
                 String importText = importStatement.getText();
-                if (statementImportsJunit(importText)) {
-                    continue;
+                if (!statementImportsJunit(importText)) {
+                    importCodeBlock.append(importText).append("\n");
                 }
-                importCodeBlock.append(importStatement.getText());
-                importCodeBlock.append("\n");
+            }
+            for (PsiImportStaticStatement importStatement : importList.getImportStaticStatements()) {
+                importCodeBlock.append(importStatement.getText()).append("\n");
             }
         }
         return importCodeBlock.toString();
+    }
+
+    /**
+     * Collects all imports needed by inlined helper methods that are not present
+     * in the kernel file's own imports. This includes:
+     * - Regular and static imports from each helper's source file
+     * - Explicit imports for classes referenced same-package in helper files
+     *   (which had no import statement there but need one in the generated default-package class)
+     */
+    public static String getHelperImports(ArrayList<PsiMethod> helpers) {
+        Set<String> importSet = new LinkedHashSet<>();
+        for (PsiMethod method : helpers) {
+            if (!(method.getContainingFile() instanceof PsiJavaFile javaFile)) continue;
+            PsiImportList importList = javaFile.getImportList();
+            if (importList != null) {
+                for (PsiImportStatement stmt : importList.getImportStatements()) {
+                    if (!statementImportsJunit(stmt.getText())) importSet.add(stmt.getText());
+                }
+                for (PsiImportStaticStatement stmt : importList.getImportStaticStatements()) {
+                    importSet.add(stmt.getText());
+                }
+            }
+            // Resolve all class references in the method body to catch same-package classes
+            PsiCodeBlock body = method.getBody();
+            if (body == null) continue;
+            for (PsiReferenceExpression ref : PsiTreeUtil.findChildrenOfType(body, PsiReferenceExpression.class)) {
+                PsiElement resolved = ref.resolve();
+                PsiClass cls = null;
+                if (resolved instanceof PsiClass c) {
+                    cls = c;
+                } else if (resolved instanceof PsiField f) {
+                    cls = f.getContainingClass();
+                } else if (resolved instanceof PsiMethod m) {
+                    cls = m.getContainingClass();
+                }
+                if (cls != null) {
+                    String fqn = cls.getQualifiedName();
+                    if (fqn != null && !fqn.startsWith("java.lang.") && !fqn.contains("$")) {
+                        importSet.add("import " + fqn + ";");
+                    }
+                }
+            }
+        }
+        if (importSet.isEmpty()) return "";
+        return String.join("\n", importSet) + "\n";
+    }
+
+    /**
+     * Collects all static fields from the classes containing the given helper methods.
+     * These constants (e.g. LIGHT_INDEX, TO_RADIANS) are referenced unqualified inside
+     * the helper methods and must be present in the generated class.
+     */
+    public static Map<String, Object> getHelperFields(ArrayList<PsiMethod> helpers) {
+        Set<PsiClass> classes = new LinkedHashSet<>();
+        for (PsiMethod method : helpers) {
+            PsiClass cls = method.getContainingClass();
+            if (cls != null) classes.add(cls);
+        }
+        Map<String, Object> fields = new LinkedHashMap<>();
+        Set<String> seenFieldNames = new HashSet<>();
+        for (PsiClass cls : classes) {
+            for (PsiField field : cls.getFields()) {
+                if (field.hasModifierProperty(PsiModifier.STATIC) && seenFieldNames.add(field.getName())) {
+                    PsiExpression initializer = field.getInitializer();
+                    Object value = initializer != null ? initializer.getText() : null;
+                    fields.put(getTypeAndModifiers(field) + field.getName(), value);
+                }
+            }
+        }
+        return fields;
+    }
+
+    /**
+     * Resolves all {@code import static X.FIELD} declarations from the kernel file and helper
+     * files and inlines the referenced constants as fields in the generated class.
+     * This eliminates bytecode references to constants-only classes (e.g. {@code Angle},
+     * {@code World}) so TornadoVM's sketch builder never needs to load them at JIT time.
+     * Method-imports (e.g. {@code import static TornadoMath.max}) are skipped because they
+     * resolve to methods, not fields.
+     */
+    public static Map<String, Object> getStaticImportFields(PsiFile kernelFile, ArrayList<PsiMethod> helpers) {
+        Set<PsiImportStaticStatement> staticImports = new LinkedHashSet<>();
+
+        // Kernel file first so its constants take precedence over helper-file duplicates
+        if (kernelFile instanceof PsiJavaFile kernelJava) {
+            PsiImportList importList = kernelJava.getImportList();
+            if (importList != null) {
+                Collections.addAll(staticImports, importList.getImportStaticStatements());
+            }
+        }
+        for (PsiMethod method : helpers) {
+            if (!(method.getContainingFile() instanceof PsiJavaFile javaFile)) continue;
+            PsiImportList importList = javaFile.getImportList();
+            if (importList != null) {
+                Collections.addAll(staticImports, importList.getImportStaticStatements());
+            }
+        }
+
+        Map<String, Object> fields = new LinkedHashMap<>();
+        Set<String> seenNames = new HashSet<>();
+        for (PsiImportStaticStatement stmt : staticImports) {
+            String memberName = stmt.getReferenceName();
+            if (memberName == null) continue; // wildcard import static X.*
+            if (!seenNames.add(memberName)) continue;
+
+            PsiClass targetClass = stmt.resolveTargetClass();
+            if (targetClass == null) continue;
+
+            PsiField field = targetClass.findFieldByName(memberName, true);
+            if (field == null || !field.hasModifierProperty(PsiModifier.STATIC)) continue;
+
+            PsiExpression initializer = field.getInitializer();
+            Object value = initializer != null ? initializer.getText() : null;
+            fields.put(getTypeAndModifiers(field) + field.getName(), value);
+        }
+        return fields;
     }
 
     // Internal utility method to validate a given PsiMethod to ensure it's a valid TornadoVM task
@@ -314,7 +429,7 @@ public class TornadoTWTask {
         // Kernel entry points registered via .task() must return void
         PsiType returnType = method.getReturnType();
         if (returnType != null && !PsiTypes.voidType().equals(returnType)) return false;
-        return !ProblemMethods.getInstance().getMethodSet().contains(method.getText());
+        return true;
     }
 
     /**
